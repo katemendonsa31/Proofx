@@ -1,7 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { notFound } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Clock, Calendar, CheckSquare, Target } from "lucide-react";
+import { ArrowLeft, Clock, Calendar, CheckSquare, Target, Sparkles, AlertCircle } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -15,24 +15,32 @@ const ENTRY_TYPE_COLOR: Record<string, string> = {
   other: "bg-gray-400",
 };
 
-export default async function EmployeeDetailPage({ params }: { params: { id: string } }) {
+export default async function EmployeeDetailPage({
+  params,
+  searchParams,
+}: {
+  params: { id: string };
+  searchParams?: { date?: string };
+}) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
 
-  // Verify this manager is assigned to this employee
+  // Verify this manager is assigned to this employee or is admin
   const { data: mapping } = await supabase
     .from("employee_manager_map")
     .select("id")
     .eq("manager_id", user.id)
     .eq("employee_id", params.id)
-    .single();
+    .maybeSingle();
 
-  // If not assigned (or if Admin is viewing, we'd skip this, but for now strict check)
-  // Need to check if user is admin or if they are the assigned manager
-  const { data: managerProfile } = await supabase.from("profiles").select("role").eq("user_id", user.id).single();
+  const { data: managerProfile } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
   const isAdmin = managerProfile?.role === "admin";
-  
   if (!mapping && !isAdmin) {
     return notFound();
   }
@@ -41,173 +49,258 @@ export default async function EmployeeDetailPage({ params }: { params: { id: str
     .from("profiles")
     .select("full_name, display_name, department, status, created_at")
     .eq("user_id", params.id)
-    .single();
+    .maybeSingle();
 
   if (!profile) return notFound();
 
-  // Fetch recent work entries
-  const sevenAgo = new Date(Date.now() - 7 * 86400000).toLocaleDateString("en-CA");
-  const { data: entries } = await supabase
+  // Selected date or default to today in IST
+  const todayIST = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
+  const selectedDate = searchParams?.date || todayIST;
+
+  // Fetch all recent entries for date picker
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
+  const { data: allRecentEntries } = await supabase
+    .from("work_entries")
+    .select("work_date")
+    .eq("user_id", params.id)
+    .gte("work_date", thirtyDaysAgo)
+    .order("work_date", { ascending: false });
+
+  const recordedDates = Array.from(new Set((allRecentEntries ?? []).map((e) => e.work_date)));
+  if (!recordedDates.includes(selectedDate)) {
+    recordedDates.unshift(selectedDate);
+  }
+
+  // Fetch entries for the selected date
+  const { data: dayEntries } = await supabase
     .from("work_entries")
     .select("*, kras(name)")
     .eq("user_id", params.id)
-    .gte("work_date", sevenAgo)
-    .order("work_date", { ascending: false })
+    .eq("work_date", selectedDate)
     .order("created_at", { ascending: false });
 
-  // Fetch KRAs
+  // Fetch daily log status for submission state
+  const { data: dailyLog } = await supabase
+    .from("daily_logs")
+    .select("status, summary_ai, confirmed_at")
+    .eq("user_id", params.id)
+    .eq("log_date", selectedDate)
+    .maybeSingle();
+
+  // Fetch active KRAs
   const { data: kras } = await supabase
     .from("kras")
     .select("*")
     .eq("user_id", params.id)
     .eq("is_active", true);
 
-  const name = profile.full_name ?? profile.display_name ?? "Unknown";
+  const name = profile.full_name ?? profile.display_name ?? "Employee";
+  const entries = dayEntries ?? [];
+  const totalHours = entries.reduce((s, e) => s + parseFloat(e.hours || 0), 0);
 
-  let entriesByDate: Record<string, any[]> = {};
-  let totalHours = 0;
+  // Time by KRA breakdown
+  const timeByKra: Record<string, number> = {};
+  entries.forEach((e) => {
+    const kName = e.kras?.name || "Unmapped";
+    timeByKra[kName] = (timeByKra[kName] || 0) + parseFloat(e.hours || 0);
+  });
 
-  if (entries && entries.length > 0) {
-    for (const e of entries) {
-      if (!entriesByDate[e.work_date]) entriesByDate[e.work_date] = [];
-      entriesByDate[e.work_date].push(e);
-      totalHours += parseFloat(e.hours || 0);
-    }
-  }
-
-  const dateGroups = Object.keys(entriesByDate).sort((a, b) => b.localeCompare(a));
+  // KRAs with no activity
+  const activeKraNames = (kras ?? []).map((k) => k.name);
+  const workedKraNames = new Set(entries.map((e) => e.kras?.name).filter(Boolean));
+  const unworkedKras = activeKraNames.filter((k) => !workedKraNames.has(k));
 
   return (
-    <div className="flex flex-col gap-8 pb-12">
+    <div className="flex flex-col gap-8 pb-12 max-w-6xl mx-auto">
       {/* Header */}
       <div>
-        <Link href="/manager/team" className="inline-flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 transition-colors mb-4">
+        <Link
+          href="/manager/team"
+          className="inline-flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 transition-colors mb-4"
+        >
           <ArrowLeft className="w-4 h-4" /> Back to Team
         </Link>
-        <div className="flex items-start justify-between">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-16 h-16 rounded-full bg-blue-100 flex items-center justify-center text-2xl font-bold text-blue-700">
               {name.slice(0, 2).toUpperCase()}
             </div>
             <div>
               <h1 className="text-2xl font-bold text-gray-900">{name}</h1>
-              <p className="text-sm text-gray-500 mt-0.5">{profile.department ?? "No department"} · Joined {new Date(profile.created_at).toLocaleDateString()}</p>
+              <p className="text-sm text-gray-500 mt-0.5">
+                {profile.department ?? "Engineering"} · {profile.status ?? "Active"}
+              </p>
             </div>
           </div>
-          <span className={`text-xs px-2.5 py-1 rounded-full font-medium capitalize ${
-            profile.status === "active" ? "bg-emerald-100 text-emerald-700" :
-            profile.status === "invited" ? "bg-amber-100 text-amber-700" :
-            "bg-red-100 text-red-700"
-          }`}>{profile.status ?? "active"}</span>
+
+          {/* Date Picker Form */}
+          <form method="GET" className="flex items-center gap-3 bg-white border p-2 rounded-xl shadow-sm">
+            <span className="text-xs font-semibold text-gray-500 pl-2">Select Date (IST):</span>
+            <input
+              type="date"
+              name="date"
+              defaultValue={selectedDate}
+              className="text-sm font-semibold border rounded-lg px-3 py-1.5 text-gray-800 bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-600"
+            />
+            <button
+              type="submit"
+              className="bg-[#1a1a1a] hover:bg-black text-white text-xs font-semibold px-4 py-2 rounded-lg"
+            >
+              View Day
+            </button>
+          </form>
         </div>
       </div>
 
-      {/* Metrics */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white border rounded-xl p-5 flex flex-col gap-3">
-          <div className="w-9 h-9 rounded-lg bg-blue-50 flex items-center justify-center text-blue-600">
-            <Calendar className="w-4 h-4" />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-gray-900">{totalHours.toFixed(1)}h</p>
-            <p className="text-xs text-gray-500">Hours (Last 7 Days)</p>
-          </div>
-        </div>
-        <div className="bg-white border rounded-xl p-5 flex flex-col gap-3">
-          <div className="w-9 h-9 rounded-lg bg-green-50 flex items-center justify-center text-green-600">
-            <CheckSquare className="w-4 h-4" />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-gray-900">{entries?.length ?? 0}</p>
-            <p className="text-xs text-gray-500">Tasks Completed</p>
-          </div>
-        </div>
-        <div className="bg-white border rounded-xl p-5 flex flex-col gap-3">
-          <div className="w-9 h-9 rounded-lg bg-purple-50 flex items-center justify-center text-purple-600">
-            <Target className="w-4 h-4" />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-gray-900">{kras?.length ?? 0}</p>
-            <p className="text-xs text-gray-500">Active KRAs</p>
+      {/* Submission Status & Summary Banner */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="bg-white border rounded-xl p-5 flex flex-col gap-2">
+          <span className="text-xs font-semibold text-gray-500">Submission Status</span>
+          <div className="flex items-center gap-2">
+            <span
+              className={`text-xs px-2.5 py-1 rounded-full font-bold uppercase ${
+                dailyLog?.status === "confirmed"
+                  ? "bg-emerald-100 text-emerald-800"
+                  : entries.length > 0
+                  ? "bg-amber-100 text-amber-800"
+                  : "bg-red-100 text-red-800"
+              }`}
+            >
+              {dailyLog?.status === "confirmed"
+                ? "Confirmed"
+                : entries.length > 0
+                ? "Draft"
+                : "Missing Submission"}
+            </span>
+            {dailyLog?.confirmed_at && (
+              <span className="text-xs text-gray-400">
+                at {new Date(dailyLog.confirmed_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+              </span>
+            )}
           </div>
         </div>
+
+        <div className="bg-white border rounded-xl p-5 flex flex-col gap-2">
+          <span className="text-xs font-semibold text-gray-500">Total Hours Logged</span>
+          <p className="text-2xl font-bold text-gray-900">{totalHours.toFixed(1)}h</p>
+        </div>
+
+        <div className="bg-white border rounded-xl p-5 flex flex-col gap-2">
+          <span className="text-xs font-semibold text-gray-500">Activities Captured</span>
+          <p className="text-2xl font-bold text-gray-900">{entries.length}</p>
+        </div>
+      </div>
+
+      {/* AI Daily Summary Card */}
+      <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-xl p-6">
+        <div className="flex items-center gap-2 text-blue-900 font-bold mb-2">
+          <Sparkles className="w-5 h-5 text-blue-600" />
+          <h3>AI Manager Summary for {selectedDate}</h3>
+        </div>
+        <p className="text-sm text-blue-950 leading-relaxed">
+          {entries.length === 0
+            ? "No updates or activities have been recorded by the employee for this date yet."
+            : dailyLog?.summary_ai ||
+              `Employee logged ${totalHours.toFixed(1)} hours across ${entries.length} activities on ${selectedDate}. Key focus areas included ${Object.keys(timeByKra).join(", ")}.`}
+        </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left Column — Timeline */}
+        {/* Left Column: Activities with KRA, Reason, and Confidence */}
         <div className="lg:col-span-2 space-y-6">
-          <h2 className="text-lg font-semibold text-gray-900">Recent Activity</h2>
-          
-          {dateGroups.length === 0 ? (
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-bold text-gray-900">Activities for {selectedDate}</h2>
+            <span className="text-xs font-semibold bg-gray-100 text-gray-600 px-2 py-1 rounded">
+              {entries.length} items
+            </span>
+          </div>
+
+          {entries.length === 0 ? (
             <div className="bg-white border rounded-xl p-8 text-center text-gray-400 text-sm">
-              No activity recorded in the last 7 days.
+              No activities found for this date.
             </div>
           ) : (
-            dateGroups.map((dateStr) => {
-              const dayEntries = entriesByDate[dateStr];
-              const dayHours = dayEntries.reduce((s, e) => s + parseFloat(e.hours || 0), 0);
-              
-              return (
-                <section key={dateStr} className="space-y-4">
+            <div className="space-y-4">
+              {entries.map((entry) => (
+                <div key={entry.id} className="bg-white border rounded-xl p-5 flex flex-col gap-3 shadow-sm">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-semibold text-gray-900">
-                      {new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}
-                    </h3>
-                    <span className="text-xs font-medium text-gray-500">{dayHours.toFixed(1)}h</span>
+                    <span
+                      className={`text-xs px-2.5 py-0.5 rounded font-semibold ${
+                        entry.kras?.name
+                          ? "bg-blue-50 text-blue-700 border border-blue-200"
+                          : "bg-amber-50 text-amber-800 border border-amber-200"
+                      }`}
+                    >
+                      {entry.kras?.name || "Unmapped"}
+                    </span>
+                    <span className="text-sm font-bold text-gray-700">{entry.hours}h</span>
                   </div>
-                  
-                  <div className="bg-white border rounded-xl p-6 space-y-5">
-                    {dayEntries.map((entry, idx) => (
-                      <div key={entry.id} className="relative pl-7">
-                        {idx < dayEntries.length - 1 && (
-                          <div className="absolute left-[9px] top-5 bottom-[-20px] w-[2px] bg-gray-100" />
-                        )}
-                        <div
-                          className={`absolute left-0 top-1.5 w-4 h-4 rounded-full border-2 border-white ${ENTRY_TYPE_COLOR[entry.entry_type] || "bg-gray-400"}`}
-                        />
-                        <div className="flex flex-col gap-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded capitalize">
-                              {entry.entry_type}
-                            </span>
-                            {entry.kras?.name && (
-                              <span className="text-xs bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded">
-                                {entry.kras.name}
-                              </span>
-                            )}
-                            <span className="text-xs text-gray-400 ml-auto">
-                              {entry.hours}h
-                            </span>
-                          </div>
-                          <p className="text-sm font-medium text-gray-900">{entry.summary}</p>
-                          {entry.details && (
-                            <p className="text-xs text-gray-500">{entry.details}</p>
-                          )}
-                        </div>
+
+                  <div>
+                    <h4 className="font-semibold text-gray-900 text-base">{entry.summary}</h4>
+                    {entry.details && <p className="text-xs text-gray-600 mt-1">{entry.details}</p>}
+                  </div>
+
+                  <div className="bg-gray-50 p-3 rounded-lg flex flex-col sm:flex-row gap-3 text-xs border border-gray-100">
+                    <div className="flex-1">
+                      <span className="font-semibold text-gray-500">Mapping Reason:</span>
+                      <p className="text-gray-700 mt-0.5">{entry.mapping_reason || "Direct employee confirmation"}</p>
+                    </div>
+                    {entry.confidence_level && (
+                      <div>
+                        <span className="font-semibold text-gray-500">Confidence:</span>
+                        <p className="font-bold text-gray-800 mt-0.5">{entry.confidence_level}</p>
                       </div>
-                    ))}
+                    )}
                   </div>
-                </section>
-              );
-            })
+                </div>
+              ))}
+            </div>
           )}
         </div>
 
-        {/* Right Column — KRAs */}
+        {/* Right Column: Time by KRA & Unworked KRAs */}
         <div className="space-y-6">
-          <h2 className="text-lg font-semibold text-gray-900">Active KRAs</h2>
-          
-          <div className="bg-white border rounded-xl overflow-hidden">
-            {(!kras || kras.length === 0) ? (
-              <div className="p-6 text-center text-gray-400 text-sm">
-                No active KRAs for this employee.
-              </div>
+          <h2 className="text-lg font-bold text-gray-900">Time by KRA</h2>
+          <div className="bg-white border rounded-xl p-5 space-y-4 shadow-sm">
+            {Object.keys(timeByKra).length === 0 ? (
+              <p className="text-xs text-gray-400">No time recorded.</p>
             ) : (
-              <div className="divide-y">
-                {kras.map(kra => (
-                  <div key={kra.id} className="p-4">
-                    <p className="text-sm font-medium text-gray-900">{kra.name}</p>
-                    {kra.description && <p className="text-xs text-gray-500 mt-1">{kra.description}</p>}
+              Object.entries(timeByKra).map(([kraName, hours]) => {
+                const pct = totalHours > 0 ? ((hours / totalHours) * 100).toFixed(0) : 0;
+                return (
+                  <div key={kraName} className="space-y-1.5">
+                    <div className="flex justify-between text-xs font-semibold">
+                      <span className="text-gray-800 truncate">{kraName}</span>
+                      <span className="text-gray-500">{hours.toFixed(1)}h ({pct}%)</span>
+                    </div>
+                    <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
+                      <div
+                        className="bg-blue-600 h-full rounded-full"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <h2 className="text-lg font-bold text-gray-900">KRAs With No Activity</h2>
+          <div className="bg-white border rounded-xl p-5 shadow-sm">
+            {unworkedKras.length === 0 ? (
+              <p className="text-xs text-emerald-600 font-semibold flex items-center gap-1.5">
+                <CheckSquare className="w-4 h-4" /> All active KRAs were addressed today!
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {unworkedKras.map((kraName) => (
+                  <div
+                    key={kraName}
+                    className="p-3 bg-amber-50/60 border border-amber-200 rounded-lg flex items-center gap-2 text-xs text-amber-900"
+                  >
+                    <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span className="font-medium">{kraName}</span>
                   </div>
                 ))}
               </div>

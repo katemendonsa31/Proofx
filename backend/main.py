@@ -1,23 +1,27 @@
 import os
+import json
+import re
 from typing import List, Optional
-from datetime import date
+from datetime import datetime
+import pytz
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import tempfile
+from difflib import SequenceMatcher
 
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 from supabase import create_client, Client
 
 load_dotenv()
 
-app = FastAPI(title="ProofX Work Intelligence API")
+app = FastAPI(title="ProofX AI Work Intelligence API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,38 +29,67 @@ app.add_middleware(
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # service_role key for admin ops
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TIMEZONE_NAME = os.getenv("DEFAULT_TIMEZONE", "Asia/Kolkata")
 
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# Setup AI Client (Groq preferred if available, or OpenAI)
+ai_client: Optional[OpenAI] = None
+is_groq = False
+
+if GROQ_API_KEY:
+    ai_client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1"
+    )
+    is_groq = True
+elif OPENAI_API_KEY:
+    ai_client = OpenAI(api_key=OPENAI_API_KEY)
+    is_groq = False
 
 security = HTTPBearer()
 
+def get_ist_now():
+    tz = pytz.timezone(TIMEZONE_NAME)
+    return datetime.now(tz)
+
+def get_ist_today_str() -> str:
+    return get_ist_now().strftime("%Y-%m-%d")
 
 def get_user_client(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
-    Creates a per-request Supabase client authenticated as the user.
-    Uses their JWT so all RLS policies apply correctly.
+    Creates a Supabase client authenticated with the user's token.
+    Falls back to service client if available for seamless access.
     """
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
     token = credentials.credentials
     client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    client.postgrest.auth(token)
-
+    
+    user_id = None
     try:
         user_response = client.auth.get_user(token)
-        if not user_response or not user_response.user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user_id = user_response.user.id
-    except HTTPException:
-        raise
+        if user_response and user_response.user:
+            user_id = user_response.user.id
     except Exception as e:
-        print("Auth verification error:", e)
-        raise HTTPException(status_code=401, detail="Authentication failed")
+        print("User token lookup error:", e)
 
+    if not user_id:
+        if SUPABASE_SERVICE_KEY:
+            try:
+                service = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                user_res = service.auth.get_user(token)
+                if user_res and user_res.user:
+                    user_id = user_res.user.id
+            except Exception as e2:
+                print("Service user lookup error:", e2)
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication failed or token invalid")
+
+    client.postgrest.auth(token)
     return client, user_id
 
 
@@ -65,103 +98,128 @@ def get_user_client(credentials: HTTPAuthorizationCredentials = Depends(security
 # ──────────────────────────────────────────
 
 class WorkEntrySchema(BaseModel):
-    summary: str = Field(description="A concise, actionable summary of the work done.")
-    details: Optional[str] = Field(default=None, description="Additional context, findings, or notes.")
-    hours: float = Field(description="Estimated hours spent. Default 0.5 if unclear.")
-    kra_name: Optional[str] = Field(default=None, description="Exact KRA name from the user's list. Null if no clear mapping.")
-    entry_type: str = Field(description="One of: meeting, deliverable, documentation, learning, bug, feature, other")
+    summary: str = Field(description="A concise summary of the work item.")
+    description: Optional[str] = Field(default=None, description="Detailed context or notes.")
+    kra_name: str = Field(default="Unmapped", description="Exact KRA name or 'Unmapped'.")
+    mapping_reason: str = Field(default="", description="One-line reason explaining the mapping.")
+    confidence_level: str = Field(default="Medium", description="High, Medium, or Low")
+    hours: float = Field(default=0.5, description="Estimated hours spent.")
+    entry_type: str = Field(default="other", description="meeting, deliverable, documentation, learning, bug, feature, other")
 
 class ExtractedWork(BaseModel):
-    entries: List[WorkEntrySchema] = Field(description="List of distinct work tasks extracted from the transcript.")
+    activities: List[WorkEntrySchema] = Field(description="List of distinct extracted activities.")
 
-class CaptureTextRequest(BaseModel):
-    text: str = Field(description="The (possibly user-edited) transcript text to extract work entries from.")
+class ExtractActivitiesRequest(BaseModel):
+    transcript: str
+    target_date: Optional[str] = None
+
+class ConfirmActivityItem(BaseModel):
+    summary: str
+    description: Optional[str] = None
+    kra_name: str
+    mapping_reason: Optional[str] = None
+    confidence_level: Optional[str] = "Medium"
+    hours: float = 0.5
+    entry_type: str = "other"
+
+class ConfirmSaveRequest(BaseModel):
+    date: str
+    activities: List[ConfirmActivityItem]
+    status: str = "confirmed"
+
+class ManagerSummaryRequest(BaseModel):
+    employee_id: str
+    date: str
 
 
 # ──────────────────────────────────────────
-# Helper: Extract + Save to Supabase
+# AI Extraction Core
 # ──────────────────────────────────────────
 
-def extract_and_save(transcript: str, supabase: Client, user_id: str) -> dict:
-    """Shared logic: run GPT-4o-mini extraction and save to Supabase."""
+def extract_activities_from_transcript(transcript: str, user_kras: list) -> List[WorkEntrySchema]:
+    if not ai_client:
+        raise HTTPException(status_code=500, detail="AI service not configured (Missing Groq or OpenAI key)")
 
-    # Fetch user's active KRAs
-    try:
-        kras_response = supabase.table("kras").select("id, name, description").eq("user_id", user_id).eq("is_active", True).execute()
-        user_kras = kras_response.data or []
-    except Exception as e:
-        print("KRA fetch error:", e)
-        user_kras = []
-
-    kra_context = ""
-    kra_map = {}
+    kra_list_text = ""
     if user_kras:
-        kra_context = "User's active KRAs (map using EXACT names):\n"
-        for kra in user_kras:
-            kra_context += f"- {kra['name']}: {kra.get('description', 'No description')}\n"
-            kra_map[kra['name'].lower().strip()] = kra['id']
+        kra_list_text = "Active KRAs:\n" + "\n".join([f"- {k['name']}: {k.get('description', '')}" for k in user_kras])
     else:
-        kra_context = "No KRAs configured yet. Leave kra_name null for all entries."
+        kra_list_text = "No KRAs configured yet. All entries should be 'Unmapped'."
 
-    system_prompt = f"""You are an expert work log assistant. Extract structured work entries from this spoken/written work diary.
+    prompt = f"""You are an expert AI work tracker and performance mapping assistant.
+Analyze the following employee daily voice/text update and extract DISTINCT individual work activities.
+
+User's KRAs:
+{kra_list_text}
 
 Rules:
-- Break into DISTINCT work items (one item per task/meeting/activity)
-- Write clear summaries, estimate hours (default 0.5 if unclear), pick the right entry_type
-- Map to KRAs using EXACT names from the list. If nothing matches, set kra_name to null
-- If someone says "spent the morning on X", that is ~3-4 hours
+1. Break down into DISTINCT work items (one item per meeting/task/code/deliverable).
+2. For each activity, determine:
+   - summary: concise, professional title (e.g., 'Coordinated mentor availability with TiE team')
+   - description: 1-2 sentence context detailing what was accomplished
+   - kra_name: the EXACT matching KRA name from the list above. If it does not clearly match any active KRA (or is personal/unrelated), mark it EXACTLY as 'Unmapped'. NEVER FORCE A MAPPING.
+   - mapping_reason: one clear sentence explaining why it maps to that KRA, or why it is marked Unmapped.
+   - confidence_level: 'High', 'Medium', or 'Low'
+   - hours: reasonable time spent in hours (default 0.5 if unspecified, morning work ~ 3.5h)
+   - entry_type: one of 'meeting', 'deliverable', 'documentation', 'learning', 'bug', 'feature', 'other'
 
-{kra_context}
+Return valid JSON with the key "activities" containing an array of activity objects.
+
+Transcript:
+\"\"\"{transcript}\"\"\"
 """
 
-    completion = openai.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Work log: {transcript}"}
-        ],
-        response_format=ExtractedWork
-    )
-    extracted = completion.choices[0].message.parsed
-    print(f"Extracted {len(extracted.entries)} entries")
+    model_name = "openai/gpt-oss-120b" if is_groq else "gpt-4o-mini"
+    
+    try:
+        response = ai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        content = response.choices[0].message.content or "{}"
+        parsed = json.loads(content)
+        
+        raw_items = parsed.get("activities", [])
+        if not raw_items and isinstance(parsed, list):
+            raw_items = parsed
 
-    # Find or create today's daily log
-    today = str(date.today())
-    log_response = supabase.table("daily_logs").select("id").eq("user_id", user_id).eq("log_date", today).execute()
+        results: List[WorkEntrySchema] = []
+        for item in raw_items:
+            k_name = item.get("kra_name") or "Unmapped"
+            if user_kras:
+                matched = next((k["name"] for k in user_kras if k["name"].lower() == k_name.lower()), None)
+                if matched:
+                    k_name = matched
+                elif k_name.lower() != "unmapped":
+                    k_name = "Unmapped"
+            else:
+                k_name = "Unmapped"
 
-    if log_response.data and len(log_response.data) > 0:
-        daily_log_id = log_response.data[0]["id"]
-    else:
-        new_log = supabase.table("daily_logs").insert({
-            "user_id": user_id,
-            "log_date": today,
-            "status": "draft"
-        }).execute()
-        daily_log_id = new_log.data[0]["id"]
+            results.append(WorkEntrySchema(
+                summary=item.get("summary", "Untitled activity"),
+                description=item.get("description", ""),
+                kra_name=k_name,
+                mapping_reason=item.get("mapping_reason", "Extracted from work diary."),
+                confidence_level=item.get("confidence_level", "Medium"),
+                hours=float(item.get("hours", 0.5)),
+                entry_type=item.get("entry_type", "other")
+            ))
 
-    # Insert each work entry
-    inserted = []
-    for entry in extracted.entries:
-        kra_id = kra_map.get(entry.kra_name.lower().strip()) if entry.kra_name else None
-        try:
-            result = supabase.table("work_entries").insert({
-                "user_id": user_id,
-                "daily_log_id": daily_log_id,
-                "entry_type": entry.entry_type,
-                "summary": entry.summary,
-                "details": entry.details,
-                "kra_id": kra_id,
-                "hours": entry.hours,
-                "status": "draft",
-                "work_date": today,
-                "is_ai_generated": True
-            }).execute()
-            inserted.append(result.data[0])
-        except Exception as e:
-            print(f"Error inserting '{entry.summary}': {e}")
+        return results
 
-    print(f"Saved {len(inserted)} entries for user {user_id}")
-    return {"entries_count": len(inserted), "entries": inserted}
+    except Exception as e:
+        print("Extraction error:", e)
+        raise HTTPException(status_code=500, detail=f"AI extraction failed: {str(e)}")
+
+
+def is_entry_duplicate(new_summary: str, existing_summaries: List[str], threshold: float = 0.8) -> bool:
+    for ex in existing_summaries:
+        ratio = SequenceMatcher(None, new_summary.lower().strip(), ex.lower().strip()).ratio()
+        if ratio >= threshold:
+            return True
+    return False
 
 
 # ──────────────────────────────────────────
@@ -170,7 +228,13 @@ Rules:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "ProofX"}
+    return {
+        "status": "ok",
+        "app": "ProofX AI Tracker",
+        "engine": "Groq" if is_groq else "OpenAI",
+        "timezone": TIMEZONE_NAME,
+        "ist_time": get_ist_now().isoformat()
+    }
 
 
 @app.post("/api/v1/transcribe")
@@ -179,43 +243,36 @@ async def transcribe_audio(
     auth: tuple = Depends(get_user_client),
 ):
     """
-    Step 1 of the record workflow.
-    Accepts audio, transcribes with Whisper, returns raw transcript text.
-    Does NOT extract tasks or write to DB — the user edits the transcript first.
+    Transcribes audio using Whisper. Returns transcript for user review/editing.
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API Key not configured")
+    if not ai_client:
+        raise HTTPException(status_code=500, detail="AI transcription service not configured")
 
-    _, user_id = auth  # user_id available for logging, not needed for transcription
-
-    # Save audio to temp file
     temp_audio_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        suffix = os.path.splitext(file.filename or "")[1] or ".webm"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
             if len(content) == 0:
                 raise HTTPException(status_code=400, detail="Uploaded audio file is empty.")
             tmp.write(content)
             temp_audio_path = tmp.name
-        print(f"Audio received: {len(content)} bytes from user {user_id}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read audio: {e}")
 
-    # Transcribe
-    try:
+        whisper_model = "whisper-large-v3" if is_groq else "whisper-1"
+
         with open(temp_audio_path, "rb") as audio_file:
-            response = openai.audio.transcriptions.create(
-                model="whisper-1",
+            response = ai_client.audio.transcriptions.create(
+                model=whisper_model,
                 file=audio_file,
                 response_format="text"
             )
-        transcript = response
-        print(f"Transcript ({len(transcript)} chars): {transcript[:120]}...")
 
-        if not transcript or not transcript.strip():
-            raise HTTPException(status_code=422, detail="No speech detected. Please speak more clearly and try again.")
+        transcript = str(response).strip()
+        
+        # Clean silence hallucinations
+        if not transcript or transcript in ["you", "Thank you.", "Bye.", "MBC 뉴스", "MBC"]:
+            # If the audio was completely silent or hallucinated single filler
+            raise HTTPException(status_code=422, detail="No clear speech detected. Please speak clearly and try again.")
 
         return {"transcript": transcript}
 
@@ -229,158 +286,159 @@ async def transcribe_audio(
             os.remove(temp_audio_path)
 
 
-@app.post("/api/v1/capture/text")
-async def capture_text(
-    request: CaptureTextRequest,
+@app.post("/api/v1/extract-activities")
+async def extract_activities_endpoint(
+    request: ExtractActivitiesRequest,
     auth: tuple = Depends(get_user_client),
 ):
     """
-    Step 2 of the record workflow.
-    Accepts the (possibly user-edited) transcript text.
-    Runs GPT-4o-mini extraction, maps to KRAs, saves to Supabase.
+    Extracts distinct activities, maps them to KRAs with reasons and confidence scores.
+    Does NOT save to DB yet — allows employee review & edits.
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API Key not configured")
-
     supabase, user_id = auth
-    text = request.text.strip()
+    transcript = request.transcript.strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Transcript cannot be empty.")
 
-    if not text:
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-
+    # Fetch user's active KRAs
     try:
-        result = extract_and_save(text, supabase, user_id)
-        return result
+        kra_res = supabase.table("kras").select("id, name, description").eq("user_id", user_id).eq("is_active", True).execute()
+        user_kras = kra_res.data or []
     except Exception as e:
-        print("Capture text error:", e)
-        raise HTTPException(status_code=500, detail=f"Failed to extract and save: {str(e)}")
+        print("Error fetching KRAs:", e)
+        user_kras = []
+
+    activities = extract_activities_from_transcript(transcript, user_kras)
+
+    target_date = request.target_date or get_ist_today_str()
+
+    return {
+        "date": target_date,
+        "activities": [a.model_dump() for a in activities],
+        "available_kras": [k["name"] for k in user_kras] + ["Unmapped"]
+    }
 
 
-@app.post("/api/v1/capture/audio")
-async def capture_audio_legacy(
-    file: UploadFile = File(...),
+@app.post("/api/v1/confirm-and-save")
+async def confirm_and_save_endpoint(
+    request: ConfirmSaveRequest,
     auth: tuple = Depends(get_user_client),
 ):
     """
-    Legacy endpoint — transcribes AND extracts in one shot.
-    Kept for backwards compatibility. Prefer the 2-step flow.
+    Saves confirmed activities into daily tracker for the specified IST date.
+    Prevents duplicates on multiple recordings within the same day.
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API Key not configured")
-
     supabase, user_id = auth
-    temp_audio_path = None
+    target_date = request.date or get_ist_today_str()
 
+    # Load active KRAs
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-            content = await file.read()
-            if len(content) == 0:
-                raise HTTPException(status_code=400, detail="Audio file is empty.")
-            tmp.write(content)
-            temp_audio_path = tmp.name
-    except HTTPException:
-        raise
+        kra_res = supabase.table("kras").select("id, name").eq("user_id", user_id).execute()
+        kra_map = {k["name"].lower().strip(): k["id"] for k in (kra_res.data or [])}
+    except Exception:
+        kra_map = {}
+
+    # Check or create daily log for target date
+    try:
+        daily_res = supabase.table("daily_logs").select("id").eq("user_id", user_id).eq("log_date", target_date).execute()
+        if daily_res.data and len(daily_res.data) > 0:
+            daily_log_id = daily_res.data[0]["id"]
+            if request.status == "confirmed":
+                supabase.table("daily_logs").update({
+                    "status": "confirmed",
+                    "confirmed_at": datetime.now(pytz.utc).isoformat()
+                }).eq("id", daily_log_id).execute()
+        else:
+            new_log = supabase.table("daily_logs").insert({
+                "user_id": user_id,
+                "log_date": target_date,
+                "status": request.status
+            }).execute()
+            daily_log_id = new_log.data[0]["id"]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize daily log: {e}")
 
-    try:
-        with open(temp_audio_path, "rb") as af:
-            response = openai.audio.transcriptions.create(
-                model="whisper-1", file=af, response_format="text"
-            )
-        transcript = response
-        if not transcript or not transcript.strip():
-            raise HTTPException(status_code=422, detail="No speech detected.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
+    # Fetch existing entries for target date to prevent duplicates (T4)
+    existing_entries_res = supabase.table("work_entries").select("summary").eq("user_id", user_id).eq("work_date", target_date).execute()
+    existing_summaries = [e["summary"] for e in (existing_entries_res.data or [])]
 
-    try:
-        result = extract_and_save(transcript, supabase, user_id)
-        result["transcript"] = transcript
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+    inserted = []
+    skipped = []
 
+    for act in request.activities:
+        if is_entry_duplicate(act.summary, existing_summaries):
+            skipped.append(act.summary)
+            continue
 
-# ──────────────────────────────────────────
-# Admin Endpoints
-# ──────────────────────────────────────────
+        kra_id = kra_map.get(act.kra_name.lower().strip()) if act.kra_name.lower().strip() != "unmapped" else None
 
-class CreateUserRequest(BaseModel):
-    email: str
-    full_name: str
-    role: str = Field(description="admin | manager | employee")
-    department: Optional[str] = None
-    temp_password: str = "12345678"
-
-
-def get_admin_client(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify caller is admin, return a service-role client for admin operations."""
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    token = credentials.credentials
-    # Verify the calling user is an admin
-    user_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    user_client.postgrest.auth(token)
-    try:
-        user_response = user_client.auth.get_user(token)
-        if not user_response or not user_response.user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        caller_id = user_response.user.id
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Authentication failed")
-
-    # Check caller has admin role
-    profile_response = user_client.table("profiles").select("role").eq("user_id", caller_id).single().execute()
-    if not profile_response.data or profile_response.data.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    # Return service-role client if available, otherwise use user client
-    if SUPABASE_SERVICE_KEY:
-        service_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        return service_client
-    return user_client
-
-
-@app.post("/api/v1/admin/create-user")
-async def create_user(
-    request: CreateUserRequest,
-    admin_client = Depends(get_admin_client),
-):
-    """Admin-only: Create a new user with a temporary password."""
-    try:
-        # Create auth user via admin API
-        new_user = admin_client.auth.admin.create_user({
-            "email": request.email,
-            "password": request.temp_password,
-            "email_confirm": True,  # Auto-confirm so they can log in immediately
-            "user_metadata": {"full_name": request.full_name}
-        })
-        user_id = new_user.user.id
-
-        # Create/update profile
-        admin_client.table("profiles").upsert({
+        row = {
             "user_id": user_id,
-            "full_name": request.full_name,
-            "display_name": request.full_name,
-            "role": request.role,
-            "department": request.department,
-            "status": "invited",
-            "temp_password_used": True,
-        }, on_conflict="user_id").execute()
+            "daily_log_id": daily_log_id,
+            "entry_type": act.entry_type,
+            "summary": act.summary,
+            "details": act.description,
+            "kra_id": kra_id,
+            "hours": act.hours,
+            "status": request.status,
+            "work_date": target_date,
+            "mapping_reason": act.mapping_reason,
+            "confidence_level": act.confidence_level,
+            "is_ai_generated": True
+        }
 
-        print(f"Created user {request.email} with role {request.role}")
-        return {"user_id": user_id, "email": request.email, "role": request.role}
+        try:
+            ins_res = supabase.table("work_entries").insert(row).execute()
+            if ins_res.data:
+                inserted.append(ins_res.data[0])
+                existing_summaries.append(act.summary)
+        except Exception as e:
+            print("Insert work entry error:", e)
 
+    return {
+        "status": "success",
+        "date": target_date,
+        "saved_count": len(inserted),
+        "skipped_duplicates": len(skipped),
+        "entries": inserted
+    }
+
+
+@app.post("/api/v1/manager/daily-summary")
+async def generate_manager_daily_summary(
+    request: ManagerSummaryRequest,
+    auth: tuple = Depends(get_user_client),
+):
+    """
+    Generates an AI executive summary for a manager viewing an employee's day.
+    """
+    supabase, caller_id = auth
+    emp_id = request.employee_id
+    day = request.date
+
+    # Fetch entries for the employee on that day
+    entries_res = supabase.table("work_entries").select("summary, details, hours, kra_id, entry_type, kras(name)").eq("user_id", emp_id).eq("work_date", day).execute()
+    entries = entries_res.data or []
+
+    if not entries:
+        return {"summary": "No activities recorded for this date."}
+
+    activities_text = "\n".join([
+        f"- {e['summary']} ({e.get('hours', 0.5)}h) [KRA: {e.get('kras', {}).get('name') if e.get('kras') else 'Unmapped'}]"
+        for e in entries
+    ])
+
+    prompt = f"""Summarize the following employee's workday for their manager in 2-3 concise, impactful bullet points:
+
+Work entries:
+{activities_text}
+"""
+    try:
+        resp = ai_client.chat.completions.create(
+            model="openai/gpt-oss-120b" if is_groq else "gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        return {"summary": resp.choices[0].message.content.strip()}
     except Exception as e:
-        print(f"Create user error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
-
+        return {"summary": f"Employee completed {len(entries)} tasks across active KRAs."}
